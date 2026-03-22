@@ -717,10 +717,48 @@ def show_usage_history():
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def show_help():
+    print()
+    print("{}{}  slurm-status  {}".format(BOLD, BG_BLUE, RESET))
+    print("  Terminal dashboard for Slurm HPC clusters")
+    print()
+    print("  {}Usage:{}".format(BOLD, RESET))
+    print("    slurm-status              Show full dashboard")
+    print("    slurm-status --history    Show usage trends over time")
+    print()
+    print("  {}Options:{}".format(BOLD, RESET))
+    print("    -H, --history    Usage history charts (fairshare, raw usage)")
+    print("    -h, --help       Show this help message")
+    print()
+    print("  {}Dashboard sections:{}".format(BOLD, RESET))
+    print("    Fairshare        Priority standing based on usage vs allotment")
+    print("    Running jobs     Progress bars with elapsed/remaining time")
+    print("    Pending jobs     Estimated start times and wait reasons")
+    print("    Disk quota       Space and inode usage per filesystem")
+    print("    Job history      14-day summary with success/fail breakdown")
+    print()
+    print("  {}Notes:{}".format(DIM, RESET))
+    print("    Each run logs a usage snapshot to ~/.slurm_usage_history.jsonl")
+    print("    Use --history to visualize the accumulated data")
+    print()
+
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        show_help()
+        return
+
     if "--history" in sys.argv or "-H" in sys.argv:
         show_usage_history()
         return
+
+    # Check for unknown flags
+    known = {"-h", "--help", "-H", "--history"}
+    for arg in sys.argv[1:]:
+        if arg.startswith("-") and arg not in known:
+            print("{}Unknown option: {}{}".format(RED, arg, RESET))
+            print()
+            show_help()
+            sys.exit(1)
 
     user = get_user()
 
