@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+"""Slurm cluster usage & priority dashboard."""
+
+import subprocess
+import sys
+import os
+import datetime
+import getpass
+import json
+
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+WHITE = "\033[37m"
+BG_BLUE = "\033[44m"
+
+def bar(fraction, width=30, fill_color=GREEN):
+    filled = int(round(fraction * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    return "{}{}{}{}{}".format(fill_color, "█" * filled, DIM, "░" * empty, RESET)
+
+def section(title):
+    print()
+    print(DIM + "─" * 60 + RESET)
+    print(BOLD + CYAN + "  " + title + RESET)
+    print(DIM + "─" * 60 + RESET)
+
+
+# ── Data fetching ────────────────────────────────────────────────────────────
+
+def run(cmd):
+    try:
+        r = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=15
+        )
+        return r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return "", str(e)
+
+def get_user():
+    return getpass.getuser()
+
+def parse_sshare(user):
+    out, _ = run("sshare -u {}".format(user))
+    for line in out.splitlines():
+        if user in line:
+            parts = line.split()
+            try:
+                idx = parts.index(user)
+                return {
+                    "raw_shares": parts[idx + 1],
+                    "norm_shares": float(parts[idx + 2]),
+                    "raw_usage": int(parts[idx + 3]),
+                    "effectv_usage": float(parts[idx + 4]),
+                    "fairshare": float(parts[idx + 5]),
+                }
+            except (ValueError, IndexError):
+                pass
+    return None
+
+def get_cluster_total():
+    out, _ = run("sshare")
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "root":
+            try:
+                return int(parts[4]) if len(parts) > 4 else 0
+            except (ValueError, IndexError):
+                pass
+    return 0
+
+def parse_sprio(user):
+    out, _ = run("sprio -u {}".format(user))
+    jobs = []
+    for line in out.splitlines():
+        parts = line.split()
+        if user not in parts:
+            continue
+        try:
+            ui = parts.index(user)
+            jobs.append({
+                "jobid": parts[0],
+                "partition": parts[1],
+                "priority": int(parts[ui + 1]),
+                "age": int(parts[ui + 3]),
+                "fairshare": int(parts[ui + 4]),
+                "partition_prio": int(parts[ui + 5]),
+            })
+        except (ValueError, IndexError):
+            pass
+    return jobs
+
+def parse_squeue(user):
+    """Get pending/running jobs with estimated start times."""
+    out, _ = run(
+        'squeue -u {} --format="%i|%j|%P|%T|%S|%V|%l|%r|%M|%L|%b" --noheader'.format(user)
+    )
+    jobs = {}
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 8:
+            jobs[parts[0]] = {
+                "jobid": parts[0],
+                "name": parts[1],
+                "partition": parts[2],
+                "state": parts[3],
+                "est_start": parts[4],
+                "submit_time": parts[5],
+                "time_limit": parts[6],
+                "reason": parts[7],
+                "elapsed": parts[8] if len(parts) > 8 else "",
+                "time_left": parts[9] if len(parts) > 9 else "",
+                "gres": parts[10] if len(parts) > 10 else "",
+            }
+    return jobs
+
+def parse_hbquota():
+    """Parse hbquota output into filesystem entries."""
+    out, _ = run("hbquota")
+    # Strip ANSI codes for parsing
+    import re
+    clean = re.sub(r'\033\[[^m]*m', '', out)
+
+    filesystems = []
+    current = None
+    for line in clean.splitlines():
+        line = line.strip()
+        if line.startswith("/"):
+            current = {"mount": line, "quota": "", "usage": "", "hard": "",
+                       "file_quota": 0, "file_limit": 0, "files": 0}
+            filesystems.append(current)
+        elif current is not None:
+            if line.startswith("Quota:"):
+                current["quota"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Hard Limit:"):
+                current["hard"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Usage:"):
+                current["usage"] = line.split(":", 1)[1].strip()
+            elif line.startswith("File Quota:"):
+                try:
+                    current["file_quota"] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("File Limit:"):
+                try:
+                    current["file_limit"] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("Files:"):
+                try:
+                    current["files"] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+    return filesystems
+
+def parse_size_to_bytes(size_str):
+    """Parse '19.2 GiB' or '1.0 TiB' to bytes."""
+    try:
+        parts = size_str.split()
+        val = float(parts[0])
+        unit = parts[1].lower() if len(parts) > 1 else "b"
+        multipliers = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
+        return val * multipliers.get(unit, 1)
+    except (ValueError, IndexError):
+        return 0
+
+def parse_sacct(user, days=14):
+    start = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    out, _ = run(
+        "sacct -u {} --starttime={} "
+        "--format=JobID,JobName%20,Partition%12,State%12,Elapsed,AllocCPUS,Start -X"
+        .format(user, start)
+    )
+    jobs = []
+    lines = out.splitlines()
+    # Skip header + separator lines
+    for line in lines:
+        if not line.strip() or line.strip().startswith("---") or "JobID" in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 6:
+            jobs.append({
+                "jobid": parts[0],
+                "name": parts[1],
+                "partition": parts[2],
+                "state": parts[3].rstrip("+"),
+                "elapsed": parts[4],
+                "cpus": parts[5],
+                "start": parts[6] if len(parts) > 6 else "N/A",
+            })
+    return jobs
+
+
+# ── Display ──────────────────────────────────────────────────────────────────
+
+def show_fairshare(share_data):
+    section("Fairshare & Priority Standing")
+
+    if not share_data:
+        print("  Could not retrieve fairshare data.")
+        return
+
+    fs = share_data["fairshare"]
+    eu = share_data["effectv_usage"]
+    ns = share_data["norm_shares"]
+
+    # Usage ratio is the real signal: < 1 means under-using your share
+    if ns > 0:
+        usage_ratio = eu / ns
+    else:
+        usage_ratio = 0
+
+    if usage_ratio < 0.5:
+        verdict = GREEN + BOLD + "HIGH PRIORITY" + RESET
+        desc = "You're using well below your share — scheduler favors you"
+        color = GREEN
+    elif usage_ratio < 1.0:
+        verdict = GREEN + BOLD + "GOOD PRIORITY" + RESET
+        desc = "You're using less than your share — still favored"
+        color = GREEN
+    elif usage_ratio < 2.0:
+        verdict = YELLOW + BOLD + "NORMAL PRIORITY" + RESET
+        desc = "Usage is around your fair share"
+        color = YELLOW
+    else:
+        verdict = RED + BOLD + "REDUCED PRIORITY" + RESET
+        desc = "Heavy usage is reducing your scheduling priority"
+        color = RED
+
+    print()
+    print("  Priority standing:  {}".format(verdict))
+    print("  {}{}{}".format(DIM, desc, RESET))
+    print()
+
+    # Usage bar: show how much of your allotment you're consuming
+    # Capped at 1.0 for display; ratio < 1 = under-using (good)
+    bar_frac = min(usage_ratio, 1.0)
+    print("  Usage of your share:")
+    print("  {}  {:.1f}%".format(bar(bar_frac, 40, color), usage_ratio * 100))
+    print("  {}0%                                        100% of your share{}".format(DIM, RESET))
+    print()
+    print("  Your share of cluster:  {}{:.4f}%{}".format(BOLD, ns * 100, RESET))
+    print("  Your actual usage:      {}{:.4f}%{}".format(BOLD, eu * 100, RESET))
+
+    if usage_ratio > 0:
+        if usage_ratio < 1:
+            r = "{}Using {:.0f}x LESS than your allotment{}".format(GREEN, 1 / usage_ratio, RESET)
+        else:
+            r = "{}Using {:.1f}x MORE than your allotment{}".format(RED, usage_ratio, RESET)
+        print("  {}".format(r))
+    print()
+
+
+def fmt_wait(delta):
+    """Format a timedelta as a human-readable wait string."""
+    total_sec = int(delta.total_seconds())
+    if total_sec < 0:
+        return "any moment"
+    days = total_sec // 86400
+    hours = (total_sec % 86400) // 3600
+    mins = (total_sec % 3600) // 60
+    parts = []
+    if days:
+        parts.append("{}d".format(days))
+    if hours:
+        parts.append("{}h".format(hours))
+    if mins or not parts:
+        parts.append("{}m".format(mins))
+    return " ".join(parts)
+
+def show_pending(pending_jobs, queue_info):
+    section("Pending Jobs")
+    print()
+
+    if not pending_jobs:
+        print("  {}No pending jobs in queue.{}".format(DIM, RESET))
+        return
+
+    now = datetime.datetime.now()
+
+    reason_labels = {
+        "Resources": "next up, waiting for GPU",
+        "Priority": "queued behind other jobs",
+        "Dependency": "waiting on another job",
+        "QOSMaxJobsPerUserLimit": "QOS job limit reached",
+        "AssocMaxJobsLimit": "account job limit reached",
+        "ReqNodeNotAvail": "requested node unavailable",
+    }
+
+    print("  {}{:<12} {:<20} {:>10}  {:<18} {}{}".format(
+        DIM, "Job ID", "Name", "Wait", "Est. Start", "Status", RESET
+    ))
+    print("  {}{}{}".format(DIM, "─" * 78, RESET))
+
+    for j in pending_jobs:
+        # Get estimated start from squeue
+        qi = queue_info.get(j["jobid"], {})
+        est_start_str = qi.get("est_start", "N/A")
+        name = qi.get("name", j.get("jobid", ""))[:19]
+        reason = qi.get("reason", "")
+
+        wait_str = ""
+        est_display = ""
+        if est_start_str and est_start_str not in ("N/A", "Unknown"):
+            try:
+                est_dt = datetime.datetime.strptime(est_start_str, "%Y-%m-%dT%H:%M:%S")
+                delta = est_dt - now
+                wait_str = fmt_wait(delta)
+                if delta.total_seconds() > 86400:
+                    est_display = est_dt.strftime("%a %b %d %H:%M")
+                else:
+                    est_display = est_dt.strftime("Today %H:%M")
+            except ValueError:
+                est_display = est_start_str
+        else:
+            est_display = "{}unknown{}".format(DIM, RESET)
+
+        # Color and label the reason
+        if reason == "Resources":
+            reason_display = GREEN + reason_labels.get(reason, reason) + RESET
+        elif reason == "Priority":
+            reason_display = YELLOW + reason_labels.get(reason, reason) + RESET
+        else:
+            reason_display = DIM + reason_labels.get(reason, reason) + RESET
+
+        print("  {:<12} {:<20} {:>10}  {:<18} {}".format(
+            j["jobid"], name, wait_str, est_display, reason_display
+        ))
+
+    print()
+
+
+def parse_time_to_seconds(time_str):
+    """Parse slurm time format (D-HH:MM:SS, HH:MM:SS, MM:SS, etc) to seconds."""
+    try:
+        days = 0
+        if "-" in time_str:
+            d, time_str = time_str.split("-", 1)
+            days = int(d)
+        parts = time_str.split(":")
+        parts = [int(p) for p in parts]
+        if len(parts) == 3:
+            return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+        elif len(parts) == 2:
+            return days * 86400 + parts[0] * 60 + parts[1]
+        elif len(parts) == 1:
+            return days * 86400 + parts[0]
+    except (ValueError, IndexError):
+        pass
+    return 0
+
+def show_running(queue_info):
+    section("Running Jobs")
+    print()
+
+    running = [j for j in queue_info.values() if j["state"] == "RUNNING"]
+    if not running:
+        print("  {}No running jobs.{}".format(DIM, RESET))
+        return
+
+    print("  {}{:<12} {:<22} {:>10} {:>10}  {}{}".format(
+        DIM, "Job ID", "Name", "Elapsed", "Remaining", "Progress", RESET
+    ))
+    print("  {}{}{}".format(DIM, "─" * 72, RESET))
+
+    for j in running:
+        name = j["name"][:21]
+        elapsed = j.get("elapsed", "")
+        time_left = j.get("time_left", "")
+        time_limit = j.get("time_limit", "")
+
+        elapsed_sec = parse_time_to_seconds(elapsed)
+        limit_sec = parse_time_to_seconds(time_limit)
+
+        if limit_sec > 0:
+            progress = elapsed_sec / limit_sec
+        else:
+            progress = 0
+
+        progress_bar = bar(progress, 20, CYAN)
+        pct = "{:.0f}%".format(progress * 100)
+
+        print("  {:<12} {:<22} {:>10} {:>10}  {} {}".format(
+            j["jobid"], name, elapsed, time_left, progress_bar, pct
+        ))
+
+    print()
+
+
+def show_quota(filesystems):
+    section("Disk Quota")
+    print()
+
+    if not filesystems:
+        print("  {}Could not retrieve quota info.{}".format(DIM, RESET))
+        return
+
+    for fs in filesystems:
+        quota_bytes = parse_size_to_bytes(fs["quota"])
+        usage_bytes = parse_size_to_bytes(fs["usage"])
+        frac = usage_bytes / quota_bytes if quota_bytes > 0 else 0
+
+        if frac > 0.9:
+            color = RED
+        elif frac > 0.75:
+            color = YELLOW
+        else:
+            color = GREEN
+
+        file_frac = fs["files"] / fs["file_quota"] if fs["file_quota"] > 0 else 0
+        if file_frac > 0.9:
+            fcolor = RED
+        elif file_frac > 0.75:
+            fcolor = YELLOW
+        else:
+            fcolor = GREEN
+
+        print("  {}{}{}".format(BOLD, fs["mount"], RESET))
+        print("    Space: {}  {}{} / {}{}  ({:.0f}%)".format(
+            bar(frac, 25, color), color, fs["usage"], fs["quota"], RESET, frac * 100
+        ))
+        print("    Files: {}  {}{:,} / {:,}{}  ({:.0f}%)".format(
+            bar(file_frac, 25, fcolor), fcolor, fs["files"], fs["file_quota"], RESET, file_frac * 100
+        ))
+        print()
+
+
+def show_history(jobs):
+    section("Recent Job History (last 14 days)")
+    print()
+
+    if not jobs:
+        print("  {}No recent jobs.{}".format(DIM, RESET))
+        return
+
+    # Stats
+    states = {}
+    for j in jobs:
+        s = j["state"]
+        states[s] = states.get(s, 0) + 1
+
+    total = len(jobs)
+    completed = states.get("COMPLETED", 0)
+    failed = states.get("FAILED", 0)
+    cancelled = states.get("CANCELLED", 0)
+    pending = states.get("PENDING", 0)
+    running = states.get("RUNNING", 0)
+
+    print("  Total jobs: {}{}{}".format(BOLD, total, RESET))
+    print()
+
+    # Status bar
+    bar_w = 40
+    if total > 0:
+        c_w = max(0, int(round(completed / total * bar_w)))
+        f_w = max(0, int(round(failed / total * bar_w)))
+        x_w = max(0, int(round(cancelled / total * bar_w)))
+        r_w = max(0, int(round(running / total * bar_w)))
+        p_w = max(0, int(round(pending / total * bar_w)))
+        # Fix rounding
+        diff = bar_w - (c_w + f_w + x_w + r_w + p_w)
+        c_w = max(0, c_w + diff)
+
+        print("  {}{}{}{}{}{}{}{}{}{}{}".format(
+            GREEN, "█" * c_w, RED, "█" * f_w, YELLOW, "█" * x_w,
+            CYAN, "█" * r_w, MAGENTA, "█" * p_w, RESET
+        ))
+    print()
+
+    parts = []
+    if completed: parts.append("{}✓ {} completed{}".format(GREEN, completed, RESET))
+    if failed:    parts.append("{}✗ {} failed{}".format(RED, failed, RESET))
+    if cancelled: parts.append("{}⊘ {} cancelled{}".format(YELLOW, cancelled, RESET))
+    if running:   parts.append("{}▶ {} running{}".format(CYAN, running, RESET))
+    if pending:   parts.append("{}◇ {} pending{}".format(MAGENTA, pending, RESET))
+    print("  " + "   ".join(parts))
+
+    if completed > 0:
+        rate = completed / total * 100
+        color = GREEN if rate >= 80 else YELLOW if rate >= 50 else RED
+        print()
+        print("  Success rate: {}{:.0f}%{}".format(color, rate, RESET))
+
+    # Last 10 jobs
+    state_colors = {
+        "COMPLETED": GREEN, "FAILED": RED, "CANCELLED": YELLOW,
+        "PENDING": MAGENTA, "RUNNING": CYAN, "TIMEOUT": RED,
+    }
+
+    print()
+    print("  {}{:<12} {:<22} {:<12} {:<10} {}{}".format(DIM, "Job ID", "Name", "State", "Elapsed", "Partition", RESET))
+    print("  {}{}{}".format(DIM, "─" * 70, RESET))
+
+    recent = jobs[-12:]
+    for j in recent:
+        sc = state_colors.get(j["state"], WHITE)
+        print("  {:<12} {:<22} {}{:<12}{} {:<10} {}".format(
+            j["jobid"], j["name"][:21], sc, j["state"], RESET, j["elapsed"], j["partition"]
+        ))
+
+    if len(jobs) > 12:
+        print("  {}... and {} more jobs{}".format(DIM, len(jobs) - 12, RESET))
+    print()
+
+
+# ── Usage history tracking ───────────────────────────────────────────────────
+
+HISTORY_FILE = os.path.expanduser("~/.slurm_usage_history.jsonl")
+
+def log_usage(share_data):
+    """Append current usage snapshot to history file."""
+    if not share_data:
+        return
+    entry = {
+        "ts": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "effectv_usage": share_data["effectv_usage"],
+        "norm_shares": share_data["norm_shares"],
+        "fairshare": share_data["fairshare"],
+        "raw_usage": share_data["raw_usage"],
+    }
+    try:
+        with open(HISTORY_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except IOError:
+        pass
+
+def load_history():
+    """Load usage history from file."""
+    entries = []
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except (ValueError, KeyError):
+                        pass
+    except IOError:
+        pass
+    return entries
+
+def resample(values, width):
+    """Resample a list of values to exactly `width` points via linear interpolation."""
+    if len(values) == width:
+        return list(values)
+    step = (len(values) - 1) / float(max(width - 1, 1))
+    sampled = []
+    for i in range(width):
+        pos = i * step
+        lo = int(pos)
+        hi = min(lo + 1, len(values) - 1)
+        frac = pos - lo
+        sampled.append(values[lo] * (1 - frac) + values[hi] * frac)
+    return sampled
+
+def sparkline(values, width=60):
+    """Render a single-row sparkline."""
+    if not values:
+        return " " * width
+    blocks = " ▁▂▃▄▅▆▇█"
+    mn, mx = min(values), max(values)
+    rng = mx - mn if mx > mn else 1.0
+    values = resample(values, width)
+    result = ""
+    for v in values:
+        idx = int(round((v - mn) / rng * (len(blocks) - 1)))
+        idx = max(0, min(len(blocks) - 1, idx))
+        result += blocks[idx]
+    return result
+
+def tall_chart(values, width=60, height=8, color=CYAN):
+    """Render a multi-row chart using block characters. Returns list of strings (top to bottom)."""
+    if not values:
+        return [" " * width] * height
+    blocks = " ▁▂▃▄▅▆▇█"
+    mn, mx = min(values), max(values)
+    rng = mx - mn if mx > mn else 1.0
+    values = resample(values, width)
+    # Normalize to 0..1
+    normed = [(v - mn) / rng for v in values]
+    lines = []
+    for row in range(height, 0, -1):
+        # This row covers the range [(row-1)/height, row/height]
+        row_lo = (row - 1) / float(height)
+        row_hi = row / float(height)
+        line = ""
+        for v in normed:
+            if v >= row_hi:
+                line += "█"
+            elif v > row_lo:
+                # Partial fill within this row
+                frac = (v - row_lo) / (row_hi - row_lo)
+                idx = int(round(frac * (len(blocks) - 1)))
+                idx = max(0, min(len(blocks) - 1, idx))
+                line += blocks[idx]
+            else:
+                line += " "
+        lines.append(line)
+    return lines
+
+def show_usage_history():
+    """Display usage history chart."""
+    entries = load_history()
+
+    print()
+    print("{}{}  Usage History  {}".format(BOLD, BG_BLUE, RESET))
+    print()
+
+    if len(entries) < 2:
+        print("  Not enough data yet. Run the dashboard a few more times to build history.")
+        print("  {}Data points collected: {}{}".format(DIM, len(entries), RESET))
+        return
+
+    # Parse timestamps and values
+    timestamps = []
+    usage_ratios = []
+    raw_usages = []
+    fairshares = []
+
+    for e in entries:
+        try:
+            ts = datetime.datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S")
+            timestamps.append(ts)
+            ns = e.get("norm_shares", 0)
+            eu = e.get("effectv_usage", 0)
+            usage_ratios.append((eu / ns * 100) if ns > 0 else 0)
+            raw_usages.append(e.get("raw_usage", 0))
+            fairshares.append(e.get("fairshare", 0))
+        except (ValueError, KeyError):
+            pass
+
+    if len(timestamps) < 2:
+        print("  Not enough valid data points.")
+        return
+
+    first = timestamps[0].strftime("%b %d %H:%M")
+    last = timestamps[-1].strftime("%b %d %H:%M")
+    span = timestamps[-1] - timestamps[0]
+
+    chart_w = 55
+    chart_h = 8
+
+    def render_chart(values, color, label_fmt="{:.1f}", unit=""):
+        """Print a tall chart with y-axis labels."""
+        mn_v = min(values)
+        mx_v = max(values)
+        lines = tall_chart(values, width=chart_w, height=chart_h, color=color)
+        for i, line in enumerate(lines):
+            # Y-axis labels: top, middle, bottom
+            if i == 0:
+                label = label_fmt.format(mx_v) + unit
+            elif i == chart_h // 2:
+                label = label_fmt.format((mn_v + mx_v) / 2) + unit
+            elif i == chart_h - 1:
+                label = label_fmt.format(mn_v) + unit
+            else:
+                label = ""
+            print("  {}{:>10}{} {}{}{}{}".format(
+                DIM, label, RESET,
+                DIM + "│" + RESET, color, line, RESET
+            ))
+        # X-axis
+        print("  {} {}{}{}".format(
+            " " * 10, DIM + "└" + "─" * chart_w + RESET, "", ""
+        ))
+        print("  {}{} {:>{}}{}".format(
+            DIM, " " * 11 + first, last, chart_w - len(first), RESET
+        ))
+
+    # Usage ratio over time
+    section("Usage of Share Over Time")
+    print()
+    cur = usage_ratios[-1]
+    render_chart(usage_ratios, CYAN, label_fmt="{:.1f}", unit="%")
+    print("  Current: {}{:.1f}%{}  Min: {:.1f}%  Max: {:.1f}%".format(
+        BOLD, cur, RESET, min(usage_ratios), max(usage_ratios)
+    ))
+    print()
+
+    # Fairshare factor over time
+    section("Fairshare Factor Over Time")
+    print()
+    render_chart(fairshares, GREEN, label_fmt="{:.4f}")
+    print("  Current: {}{:.4f}{}  Min: {:.4f}  Max: {:.4f}".format(
+        BOLD, fairshares[-1], RESET, min(fairshares), max(fairshares)
+    ))
+    print()
+
+    # Raw usage over time
+    section("Raw Usage (CPU-seconds) Over Time")
+    print()
+    render_chart(raw_usages, YELLOW, label_fmt="{:,.0f}")
+    print("  Current: {}{:,}{}  Start: {:,}  Delta: {:,}".format(
+        BOLD, raw_usages[-1], RESET, raw_usages[0], raw_usages[-1] - raw_usages[0]
+    ))
+    print()
+
+    # Summary
+    print("  {}Data points: {}  |  Span: {}{}".format(
+        DIM, len(entries),
+        "{} days".format(span.days) if span.days > 0 else "{:.1f} hours".format(span.total_seconds() / 3600),
+        RESET
+    ))
+    print("  {}History file: {}{}".format(DIM, HISTORY_FILE, RESET))
+    print()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    if "--history" in sys.argv or "-H" in sys.argv:
+        show_usage_history()
+        return
+
+    user = get_user()
+
+    print()
+    print("{}{}  SLURM Status Dashboard  {}".format(BOLD, BG_BLUE, RESET))
+    print("  {}User: {}{}{}  |  {}{}".format(
+        DIM, RESET + BOLD, user, RESET,
+        DIM, datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + RESET
+    ))
+
+    share_data = parse_sshare(user)
+    log_usage(share_data)
+    show_fairshare(share_data)
+
+    queue_info = parse_squeue(user)
+
+    show_running(queue_info)
+
+    pending_jobs = parse_sprio(user)
+    show_pending(pending_jobs, queue_info)
+
+    filesystems = parse_hbquota()
+    show_quota(filesystems)
+
+    history = parse_sacct(user)
+    show_history(history)
+
+if __name__ == "__main__":
+    main()
