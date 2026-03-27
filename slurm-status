@@ -500,7 +500,7 @@ def show_history(jobs):
     print("  {}{:<12} {:<22} {:<12} {:<10} {}{}".format(DIM, "Job ID", "Name", "State", "Elapsed", "Partition", RESET))
     print("  {}{}{}".format(DIM, "─" * 70, RESET))
 
-    recent = jobs[-12:]
+    recent = list(reversed(jobs[-12:]))
     for j in recent:
         sc = state_colors.get(j["state"], WHITE)
         print("  {:<12} {:<22} {}{:<12}{} {:<10} {}".format(
@@ -508,7 +508,7 @@ def show_history(jobs):
         ))
 
     if len(jobs) > 12:
-        print("  {}... and {} more jobs{}".format(DIM, len(jobs) - 12, RESET))
+        print("  {}... and {} older jobs{}".format(DIM, len(jobs) - 12, RESET))
     print()
 
 
